@@ -352,6 +352,68 @@ end
         end
     end
 
+    @testset "single project re-adds [sources] path deps to manifest (#3021)" begin
+        # A path-sourced package listed in [deps] must end up in the resolved
+        # Manifest.toml. It is removed for resolution (can't be resolved from the
+        # registry) and was previously never added back, so the build step failed
+        # with the package present in Project.toml but absent from Manifest.toml.
+        mktempdir() do dir
+            cd(dir) do
+                # Locally-developed dependency referenced by path.
+                mkdir("CorePkg")
+                write("CorePkg/Project.toml", """
+                name = "CorePkg"
+                uuid = "33333333-3333-3333-3333-333333333333"
+                version = "1.2.3"
+                """)
+                mkdir("CorePkg/src")
+                write("CorePkg/src/CorePkg.jl", "module CorePkg\nend\n")
+
+                # Package under test: a registry dep plus a path-sourced dep in [deps].
+                mkdir("SubPackage")
+                write("SubPackage/Project.toml", """
+                name = "SubPackage"
+                uuid = "44444444-4444-4444-4444-444444444444"
+                version = "0.1.0"
+
+                [deps]
+                JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+                CorePkg = "33333333-3333-3333-3333-333333333333"
+
+                [sources]
+                CorePkg = {path = "../CorePkg"}
+
+                [compat]
+                julia = "1.10"
+                JSON = "0.20, 0.21"
+                """)
+
+                run(`$(Base.julia_cmd()) $downgrade_jl "" "SubPackage" "deps" "1.10"`)
+
+                manifest_file = joinpath("SubPackage", "Manifest.toml")
+                @test isfile(manifest_file)
+                manifest = TOML.parsefile(manifest_file)
+                deps = manifest["deps"]
+
+                # Registry dep resolved to its minimal version.
+                deps_JSON = get(deps, "JSON", [])
+                @test !isempty(deps_JSON)
+                @test startswith(deps_JSON[1]["version"], "0.20")
+
+                # #3021: the path-sourced dep is present as a path dependency.
+                core_entry = get(deps, "CorePkg", [])
+                @test !isempty(core_entry)
+                @test core_entry[1]["path"] == "../CorePkg"
+                @test core_entry[1]["uuid"] == "33333333-3333-3333-3333-333333333333"
+                @test core_entry[1]["version"] == "1.2.3"
+
+                # Project hash matches what Pkg expects for the restored project.
+                @test manifest["project_hash"] ==
+                      expected_project_hash(joinpath(dir, "SubPackage", "Project.toml"))
+            end
+        end
+    end
+
     @testset "merged resolution with test dependencies" begin
         mktempdir() do dir
             cd(dir) do

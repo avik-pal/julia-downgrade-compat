@@ -342,6 +342,77 @@ function set_manifest_project_hash(manifest_file::String, project_file::String)
 end
 
 """
+    add_source_packages_to_manifest(manifest_file, project_file, dir, source_pkgs)
+
+Re-add local path-sourced packages to `manifest_file` after resolution.
+
+The resolver runs with these packages removed from the project (they cannot be
+resolved from the registry), so they are absent from the resulting manifest even
+though they remain in the project's `[deps]`. Without this, the build step fails
+with errors like "expected package X to be listed in the manifest" / "X is listed
+in Project.toml but absent from Manifest.toml" (see #3021). Each such package is
+written back as a path dependency pointing at the same location given in
+`[sources]`, mirroring `add_main_package_to_manifest`.
+
+Note: only packages that are themselves in `[deps]` need to be in this manifest;
+packages sourced solely for a test target are not part of the resolved
+environment. The path packages' own (unique) transitive dependencies are not
+re-resolved here, so a fully locked test of those is out of scope for this step.
+"""
+function add_source_packages_to_manifest(
+        manifest_file::String, project_file::String, dir::AbstractString, source_pkgs)
+    isempty(source_pkgs) && return
+    if !isfile(manifest_file)
+        @warn "Manifest file not found: $manifest_file"
+        return
+    end
+
+    project = TOML.parsefile(project_file)
+    sources = get(project, "sources", Dict())
+    deps = get(project, "deps", Dict())
+
+    entry_lines = String[]
+    for pkg in source_pkgs
+        # Only packages that are part of this environment's [deps] belong in its
+        # manifest; sources used only by a test target are not.
+        haskey(deps, pkg) || continue
+        src = get(sources, pkg, nothing)
+        (src isa Dict && haskey(src, "path")) || continue
+
+        pkg_path = src["path"]
+        candidates = [joinpath(dir, pkg_path, "Project.toml"),
+                      joinpath(dir, pkg_path, "JuliaProject.toml")]
+        filter!(isfile, candidates)
+        uuid = get(deps, pkg, nothing)
+        version = nothing
+        if !isempty(candidates)
+            pkg_project = TOML.parsefile(first(candidates))
+            uuid = get(pkg_project, "uuid", uuid)
+            version = get(pkg_project, "version", nothing)
+        end
+        if uuid === nothing
+            @warn "Could not determine uuid for source package $pkg, skipping manifest entry"
+            continue
+        end
+
+        push!(entry_lines, "[[deps.$pkg]]")
+        push!(entry_lines, "path = \"$pkg_path\"")
+        push!(entry_lines, "uuid = \"$uuid\"")
+        version !== nothing && push!(entry_lines, "version = \"$version\"")
+        push!(entry_lines, "")
+        @info "Added source package $pkg to manifest as a path dependency"
+    end
+    isempty(entry_lines) && return
+
+    manifest_content = read(manifest_file, String)
+    open(manifest_file, "w") do io
+        print(io, manifest_content)
+        endswith(manifest_content, "\n") || println(io)
+        print(io, join(entry_lines, "\n"))
+    end
+end
+
+"""
     resolve_directory(dir, resolver_path, resolver_mode, julia_version, mode, ignore_pkgs)
 
 Resolve dependencies for a single directory. Handles source packages by temporarily
@@ -371,6 +442,14 @@ function resolve_directory(
     finally
         # Always restore the original Project.toml, even if resolution fails
         restore_project_file(project_file, original_content)
+    end
+
+    # Re-add local path-sourced packages (removed for resolution) to the manifest
+    # so the resolved environment is complete enough to instantiate/build (#3021),
+    # then refresh the project hash so Pkg sees the manifest as up to date.
+    if !isempty(source_pkgs)
+        add_source_packages_to_manifest(manifest_file, project_file, dir, source_pkgs)
+        set_manifest_project_hash(manifest_file, project_file)
     end
 
     # For forcedeps mode, verify that the resolved versions match the lower bounds
