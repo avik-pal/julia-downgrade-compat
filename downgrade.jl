@@ -65,11 +65,15 @@ end
     remove_source_packages_from_project(project_file, source_pkgs)
 
 Create a modified version of the Project.toml with source packages
-removed from [deps], [compat], [extras], and [sources] sections.
+removed from [deps], [compat], [extras], [sources], and [targets] sections.
 Returns the original content so it can be restored later.
 
 Note: We must also remove from [sources] because Pkg validates that any
-package in [sources] must be in [deps] or [extras].
+package in [sources] must be in [deps] or [extras]; and from [targets]
+because Pkg validates that any package in a target must be in [deps],
+[weakdeps], or [extras]. A source package that also appears in a test
+target (common in monorepos that dev a sibling package for testing) would
+otherwise leave a dangling target reference once removed from [extras].
 """
 function remove_source_packages_from_project(project_file::String, source_pkgs::Set{String})
     if isempty(source_pkgs)
@@ -89,6 +93,22 @@ function remove_source_packages_from_project(project_file::String, source_pkgs::
             delete!(section, pkg)
             modified = true
             @info "Temporarily removing $pkg from [$section_name] for resolution"
+        end
+    end
+
+    # Remove from each list in [targets]. A source package removed from [extras]
+    # above but left in a target would fail Pkg validation ("Dependency X in
+    # target test not listed in deps, weakdeps or extras") before resolution runs.
+    if haskey(project, "targets")
+        for (target_name, target_list) in project["targets"]
+            target_list isa AbstractVector || continue
+            for pkg in source_pkgs
+                if pkg in target_list
+                    filter!(!isequal(pkg), target_list)
+                    modified = true
+                    @info "Temporarily removing $pkg from [targets.$target_name] for resolution"
+                end
+            end
         end
     end
 

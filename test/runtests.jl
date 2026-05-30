@@ -289,6 +289,69 @@ end
         end
     end
 
+    @testset "single project with [sources] path dep used in [targets]" begin
+        # Regression test: a package that devs a sibling via [sources] and also
+        # lists it as a test dependency in [targets]. The source package must be
+        # stripped from [targets] as well as [extras] during resolution, otherwise
+        # Pkg validation fails with "Dependency DevTool in target test not listed
+        # in deps, weakdeps or extras" and the resolver never runs.
+        mktempdir() do dir
+            cd(dir) do
+                # Sibling package that is dev'd via a local path source.
+                mkdir("DevTool")
+                write("DevTool/Project.toml", """
+                name = "DevTool"
+                uuid = "11111111-1111-1111-1111-111111111111"
+                version = "0.1.0"
+                """)
+                mkdir("DevTool/src")
+                write("DevTool/src/DevTool.jl", "module DevTool\nend\n")
+
+                # Package under test: a registry dep plus a path-sourced test dep
+                # that is referenced from [targets].
+                mkdir("SubPackage")
+                write("SubPackage/Project.toml", """
+                name = "SubPackage"
+                uuid = "22222222-2222-2222-2222-222222222222"
+                version = "0.1.0"
+
+                [deps]
+                JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+
+                [extras]
+                DevTool = "11111111-1111-1111-1111-111111111111"
+                Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+                [sources]
+                DevTool = {path = "../DevTool"}
+
+                [compat]
+                julia = "1.10"
+                JSON = "0.20, 0.21"
+
+                [targets]
+                test = ["DevTool", "Test"]
+                """)
+
+                # Before the fix this throws a ProcessFailedException.
+                run(`$(Base.julia_cmd()) $downgrade_jl "" "SubPackage" "deps" "1.10"`)
+
+                @test isfile(joinpath("SubPackage", "Manifest.toml"))
+                manifest = TOML.parsefile(joinpath("SubPackage", "Manifest.toml"))
+                deps_JSON = get(manifest["deps"], "JSON", [])
+                @test !isempty(deps_JSON)
+                @test startswith(deps_JSON[1]["version"], "0.20")
+
+                # The original Project.toml must be restored verbatim, including
+                # the [targets] and [sources] entries that were stripped.
+                restored = TOML.parsefile(joinpath("SubPackage", "Project.toml"))
+                @test restored["targets"]["test"] == ["DevTool", "Test"]
+                @test haskey(restored["sources"], "DevTool")
+                @test haskey(restored["extras"], "DevTool")
+            end
+        end
+    end
+
     @testset "merged resolution with test dependencies" begin
         mktempdir() do dir
             cd(dir) do
