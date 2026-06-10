@@ -436,6 +436,13 @@ Note: only packages that are themselves in `[deps]` need to be in this manifest;
 packages sourced solely for a test target are not part of the resolved
 environment. The path packages' own (unique) transitive dependencies are not
 re-resolved here, so a fully locked test of those is out of scope for this step.
+
+If the resolver already emitted a registry entry for a source package (which
+happens whenever another resolved package depends on it), that entry is removed
+first — appending without removal would leave two `[[deps.X]]` entries with the
+same name and Pkg rejects the manifest with "Invalid manifest format: X's
+dependency on ... is ambiguous". The path source must win, since that is the
+whole point of the `[sources]` override.
 """
 function add_source_packages_to_manifest(
         manifest_file::String, project_file::String, dir::AbstractString, source_pkgs)
@@ -450,6 +457,7 @@ function add_source_packages_to_manifest(
     deps = get(project, "deps", Dict())
 
     entry_lines = String[]
+    added_pkgs = String[]
     for pkg in source_pkgs
         # Only packages that are part of this environment's [deps] belong in its
         # manifest; sources used only by a test target are not.
@@ -478,9 +486,25 @@ function add_source_packages_to_manifest(
         push!(entry_lines, "uuid = \"$uuid\"")
         version !== nothing && push!(entry_lines, "version = \"$version\"")
         push!(entry_lines, "")
+        push!(added_pkgs, pkg)
         @info "Added source package $pkg to manifest as a path dependency"
     end
     isempty(entry_lines) && return
+
+    # Drop any resolver-emitted registry entries for the packages we are about
+    # to add as path entries; a duplicate [[deps.X]] makes the manifest invalid.
+    manifest = TOML.parsefile(manifest_file)
+    manifest_deps = get(manifest, "deps", Dict{String, Any}())
+    replaced = filter(pkg -> haskey(manifest_deps, pkg), added_pkgs)
+    if !isempty(replaced)
+        for pkg in replaced
+            delete!(manifest_deps, pkg)
+            @info "Removed resolver-emitted registry entry for source package $pkg"
+        end
+        open(manifest_file, "w") do io
+            TOML.print(io, manifest; sorted = true)
+        end
+    end
 
     manifest_content = read(manifest_file, String)
     open(manifest_file, "w") do io
