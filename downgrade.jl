@@ -1,5 +1,6 @@
 using TOML
 using Pkg
+using Downloads
 
 ignore_pkgs = filter(!isempty, map(strip, split(ARGS[1], ",")))
 dirs = filter(!isempty, map(strip, split(ARGS[2], ",")))
@@ -7,11 +8,79 @@ mode = length(ARGS) >= 3 ? ARGS[3] : "deps"
 current_julia_minor = string(VERSION.major, ".", VERSION.minor)
 julia_version = length(ARGS) >= 4 ? ARGS[4] : current_julia_minor
 
-# Convert "1" to the current running Julia version (e.g., "1.12" for Julia 1.12.3)
-# This ensures the resolved manifest matches the Julia version that will read it
-if julia_version == "1"
-    julia_version = current_julia_minor
-    @info "Converted julia_version \"1\" to \"$julia_version\" (current Julia version)"
+# The resolver only accepts numeric compat specs, so setup-julia channel
+# aliases ("lts", "pre", "min", "nightly", ...) must be converted to a numeric
+# major.minor first. Each alias is resolved to what it actually denotes (the
+# same thing setup-julia would install for it), not to the runtime Julia:
+#   - "lts"/"release": the juliaup version database's channel mapping
+#   - "pre": the highest version (prereleases included) in the official
+#     versions.json, matching setup-julia's includePrerelease resolution
+#   - "min": the lower bound of the project's own `julia` compat entry
+#   - "nightly"/"X.Y-nightly": nightlies have no registry presence, so use the
+#     runtime Julia / the numeric prefix (under setup-julia these match)
+# The versiondb/versions.json are machine-generated with a stable shape, so the
+# needed fields are extracted with targeted regexes rather than a JSON parser
+# (none is available in stdlib for the Julia versions this action supports).
+
+"""
+    compat_lower_bound_minor(compat_str)
+
+Lower bound of a Pkg compat entry as "major.minor", e.g. "1.6, 1.10" -> "1.6",
+"^1.10" -> "1.10", "1.6 - 1.12" -> "1.6".
+"""
+function compat_lower_bound_minor(compat_str::AbstractString)
+    first_spec = strip(first(split(compat_str, ",")))
+    m = match(r"(\d+)(?:\.(\d+))?", first_spec)
+    m === nothing && error("Cannot parse julia compat entry: $compat_str")
+    return string(m.captures[1], ".", something(m.captures[2], "0"))
+end
+
+function resolve_julia_version_spec(spec::AbstractString, dirs, current_julia_minor)
+    spec == "1" && return current_julia_minor
+    if spec in ("lts", "release")
+        url = "https://raw.githubusercontent.com/JuliaLang/juliaup/main/versiondb/versiondb-x86_64-unknown-linux-gnu.json"
+        db = read(Downloads.download(url), String)
+        m = match(Regex("\"$spec\"\\s*:\\s*\\{\\s*\"Version\"\\s*:\\s*\"(\\d+\\.\\d+)"), db)
+        m === nothing && error("Could not find the \"$spec\" channel in the juliaup version database")
+        return String(m.captures[1])
+    end
+    if spec == "pre"
+        vj = read(Downloads.download("https://julialang-s3.julialang.org/bin/versions.json"), String)
+        vers = [VersionNumber(m.captures[1])
+                for m in eachmatch(r"\"(\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?)\"\s*:\s*\{", vj)]
+        isempty(vers) && error("Could not parse any versions from versions.json")
+        v = maximum(vers)
+        return string(v.major, ".", v.minor)
+    end
+    if spec == "min"
+        isempty(dirs) && error("julia_version \"min\" requires at least one project")
+        project_file = joinpath(dirs[1], "Project.toml")
+        isfile(project_file) || (project_file = joinpath(dirs[1], "JuliaProject.toml"))
+        isfile(project_file) || error("julia_version \"min\": no Project.toml in $(dirs[1])")
+        compat = get(get(TOML.parsefile(project_file), "compat", Dict()), "julia", nothing)
+        compat === nothing &&
+            error("julia_version \"min\": no `julia` compat entry in $project_file")
+        return compat_lower_bound_minor(compat)
+    end
+    spec == "nightly" && return current_julia_minor
+    m = match(r"^(\d+\.\d+)-[A-Za-z]", spec)
+    m !== nothing && return String(m.captures[1])
+    # Reject unknown aliases with a clear message instead of the resolver's
+    # cryptic "Invalid compat version spec"; anything else (numeric versions
+    # and other resolver-understood specs) passes through unchanged.
+    occursin(r"^[A-Za-z]+$", spec) &&
+        error("Unsupported julia_version channel alias \"$spec\". Use a numeric " *
+              "version like \"1.10\" or one of: 1, lts, release, pre, min, " *
+              "nightly, <major.minor>-nightly.")
+    return spec
+end
+
+if julia_version != current_julia_minor
+    original_spec = julia_version
+    julia_version = resolve_julia_version_spec(julia_version, dirs, current_julia_minor)
+    if julia_version != original_spec
+        @info "Converted julia_version \"$original_spec\" to \"$julia_version\""
+    end
 end
 
 if julia_version != current_julia_minor

@@ -59,6 +59,104 @@ end
         end
     end
 
+    # The resolver only accepts numeric compat specs, so setup-julia channel
+    # aliases must be converted to the numeric version they actually denote
+    # (lts/release/pre from the official version databases, min from the
+    # project's julia compat lower bound, nightly from the runtime).
+    @testset "channel alias julia_version specs" begin
+        current_minor = string(VERSION.major, ".", VERSION.minor)
+
+        # Run the script with the given spec in a fresh project; return the
+        # numeric version the alias was converted to, whether the full
+        # resolution succeeded, and the parsed manifest (or nothing).
+        function run_with_spec(spec)
+            mktempdir() do dir
+                cd(dir) do
+                    write(
+                        "Project.toml",
+                        """
+                        name = "TestPackage"
+                        version = "0.1.0"
+
+                        [deps]
+                        JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+
+                        [compat]
+                        julia = "1.10"
+                        JSON = "0.20, 0.21"
+                        """,
+                    )
+                    err = IOBuffer()
+                    proc = run(pipeline(
+                            `$(Base.julia_cmd()) $downgrade_jl "" "." "deps" $spec`;
+                            stderr = err,
+                        ); wait = false)
+                    wait(proc)
+                    log = String(take!(err))
+                    m = match(r"Converted julia_version \"[^\"]+\" to \"(\d+\.\d+)\"", log)
+                    converted = m === nothing ? nothing : String(m.captures[1])
+                    manifest = isfile("Manifest.toml") ? TOML.parsefile("Manifest.toml") :
+                        nothing
+                    success(proc) || println("[$spec] script failed; log:\n", log)
+                    return converted, success(proc), manifest
+                end
+            end
+        end
+
+        # Deterministic aliases: target <= runtime, so resolution must succeed
+        min_v, min_ok, min_manifest = run_with_spec("min")
+        @test min_v == "1.10"  # the project's julia compat lower bound
+        @test min_ok
+        @test startswith(min_manifest["deps"]["JSON"][1]["version"], "0.20")
+
+        nightly_v, nightly_ok, _ = run_with_spec("nightly")
+        @test nightly_v == current_minor
+        @test nightly_ok
+
+        versioned_nightly_v, versioned_nightly_ok, _ = run_with_spec("$(current_minor)-nightly")
+        @test versioned_nightly_v == current_minor
+        @test versioned_nightly_ok
+
+        # Database-resolved aliases: exact values change over time, so check
+        # they are numeric and correctly ordered (lts <= release <= pre). The
+        # lts target is never newer than a supported runtime, so its full
+        # resolution must succeed; release/pre may target a Julia newer than
+        # the runtime, where the resolver legitimately lacks stdlib data
+        # (cross-runtime mode), so only the conversion is asserted for them.
+        lts_v, lts_ok, lts_manifest = run_with_spec("lts")
+        release_v, _, _ = run_with_spec("release")
+        pre_v, _, _ = run_with_spec("pre")
+        @test lts_v !== nothing && release_v !== nothing && pre_v !== nothing
+        @test VersionNumber(lts_v) >= v"1.6"
+        @test VersionNumber(lts_v) <= VersionNumber(release_v)
+        @test VersionNumber(release_v) <= VersionNumber(pre_v)
+        @test lts_ok
+        @test startswith(lts_manifest["deps"]["JSON"][1]["version"], "0.20")
+
+        # Unknown aliases fail with a clear error instead of reaching the resolver
+        @testset "unknown alias rejected" begin
+            mktempdir() do dir
+                cd(dir) do
+                    write(
+                        "Project.toml",
+                        """
+                        name = "TestPackage"
+                        version = "0.1.0"
+                        """,
+                    )
+                    err = IOBuffer()
+                    proc = run(pipeline(
+                            `$(Base.julia_cmd()) $downgrade_jl "" "." "deps" "notachannel"`;
+                            stderr = err,
+                        ); wait = false)
+                    wait(proc)
+                    @test !success(proc)
+                    @test occursin("Unsupported julia_version channel alias", String(take!(err)))
+                end
+            end
+        end
+    end
+
     @testset "forcedeps mode - passes when lower bounds match" begin
         mktempdir() do dir
             cd(dir) do
