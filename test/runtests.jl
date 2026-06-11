@@ -387,6 +387,50 @@ end
         end
     end
 
+    @testset "extras and targets.test (old-style test deps)" begin
+        mktempdir() do dir
+            cd(dir) do
+                toml_content = """
+                name = "TestPackage"
+                uuid = "a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d"
+                version = "0.1.0"
+
+                [deps]
+                JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+
+                [extras]
+                DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
+
+                [targets]
+                test = ["DataStructures"]
+
+                [compat]
+                JSON = "0.20, 0.21"
+                DataStructures = "0.17, 0.18"
+                """
+                write("Project.toml", toml_content)
+
+                # Run the downgrade script
+                run(`$(Base.julia_cmd()) $downgrade_jl "" "." "deps" "1.10"`)
+
+                # Verify Manifest.toml was created
+                @test isfile("Manifest.toml")
+
+                # Parse the manifest to check versions
+                manifest = TOML.parsefile("Manifest.toml")
+
+                # Verify BOTH JSON and DataStructures are in the manifest
+                # and resolved to their lower bounds.
+                deps = manifest["deps"]
+                @test haskey(deps, "JSON")
+                @test haskey(deps, "DataStructures")
+
+                @test startswith(deps["JSON"][1]["version"], "0.20")
+                @test startswith(deps["DataStructures"][1]["version"], "0.17")
+            end
+        end
+    end
+
     @testset "single project with [sources] path dep used in [targets]" begin
         # Regression test: a package that devs a sibling via [sources] and also
         # lists it as a test dependency in [targets]. The source package must be

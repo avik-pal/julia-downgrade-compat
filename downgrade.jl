@@ -222,8 +222,11 @@ function create_merged_project(main_project_file::String, test_project_file::Str
     main_project = TOML.parsefile(main_project_file)
     test_project = TOML.parsefile(test_project_file)
 
-    # Get source packages from test project (e.g., the main package itself)
-    source_pkgs = get_source_packages(test_project_file)
+    # Get source packages from both projects (e.g., the main package itself)
+    source_pkgs = get_source_packages(main_project_file)
+    if main_project_file != test_project_file
+        union!(source_pkgs, get_source_packages(test_project_file))
+    end
 
     # Start with a copy of the main project
     merged = deepcopy(main_project)
@@ -231,23 +234,79 @@ function create_merged_project(main_project_file::String, test_project_file::Str
     # Remove workspace section (not needed for resolution)
     delete!(merged, "workspace")
 
+    # Merge extras from main project into deps (old-style test dependencies)
+    # This ensures that even in the "new style" with test/Project.toml, any
+    # legacy extras in the root project that might still be used are included.
+    # For the "old style" case where test_project_file == main_project_file,
+    # this is where the test dependencies are actually added to [deps].
+    if haskey(main_project, "extras")
+        deps = get!(merged, "deps", Dict{String, Any}())
+        for (pkg, uuid) in main_project["extras"]
+            if pkg ∉ source_pkgs
+                if !haskey(deps, pkg)
+                    deps[pkg] = uuid
+                    @info "Adding main project extra to merged project: $pkg"
+                end
+
+                if haskey(merged, "weakdeps") && haskey(merged["weakdeps"], pkg)
+                    delete!(merged["weakdeps"], pkg)
+                    @info "Promoting $pkg from weakdep to dependency in merged project"
+                end
+            end
+        end
+    end
+
     # Merge deps from test project (excluding source packages)
     # If a package is weak in main but strong in test, promote it to strong
     # in the merged project by removing it from weakdeps.
-    test_deps = get(test_project, "deps", Dict())
-    if !haskey(merged, "deps")
-        merged["deps"] = Dict{String, Any}()
-    end
-    for (pkg, uuid) in test_deps
-        if pkg ∉ source_pkgs
-            if !haskey(merged["deps"], pkg)
-                merged["deps"][pkg] = uuid
-                @info "Adding test dependency to merged project: $pkg"
-            end
+    if main_project_file != test_project_file
+        test_deps = get(test_project, "deps", Dict())
+        if !haskey(merged, "deps")
+            merged["deps"] = Dict{String, Any}()
+        end
+        for (pkg, uuid) in test_deps
+            if pkg ∉ source_pkgs
+                if !haskey(merged["deps"], pkg)
+                    merged["deps"][pkg] = uuid
+                    @info "Adding test dependency to merged project: $pkg"
+                end
 
-            if haskey(merged, "weakdeps") && haskey(merged["weakdeps"], pkg)
-                delete!(merged["weakdeps"], pkg)
-                @info "Promoting $pkg from weakdep to dependency in merged project"
+                if haskey(merged, "weakdeps") && haskey(merged["weakdeps"], pkg)
+                    delete!(merged["weakdeps"], pkg)
+                    @info "Promoting $pkg from weakdep to dependency in merged project"
+                end
+            end
+        end
+
+        # Merge compat entries from test project
+        test_compat = get(test_project, "compat", Dict())
+        if !haskey(merged, "compat")
+            merged["compat"] = Dict{String, Any}()
+        end
+        for (pkg, compat) in test_compat
+            if pkg ∉ source_pkgs
+                if haskey(merged["compat"], pkg)
+                    # Both have compat - keep both constraints (Resolver.jl will find intersection)
+                    # For simplicity, we keep the main project's compat if they differ
+                    @info "Package $pkg has compat in both projects, using main project's compat"
+                else
+                    merged["compat"][pkg] = compat
+                    @info "Adding test compat to merged project: $pkg = \"$compat\""
+                end
+            end
+        end
+
+        # Merge weakdeps from test project
+        test_weakdeps = get(test_project, "weakdeps", Dict())
+        if !isempty(test_weakdeps)
+            if !haskey(merged, "weakdeps")
+                merged["weakdeps"] = Dict{String, Any}()
+            end
+            for (pkg, uuid) in test_weakdeps
+                if pkg ∉ source_pkgs && !haskey(merged["weakdeps"], pkg)
+                    merged["weakdeps"][pkg] = uuid
+                    @info "Adding test weakdep to merged project: $pkg"
+                end
             end
         end
     end
@@ -255,38 +314,6 @@ function create_merged_project(main_project_file::String, test_project_file::Str
     # Remove empty [weakdeps] section after promotions
     if haskey(merged, "weakdeps") && isempty(merged["weakdeps"])
         delete!(merged, "weakdeps")
-    end
-
-    # Merge compat entries from test project
-    test_compat = get(test_project, "compat", Dict())
-    if !haskey(merged, "compat")
-        merged["compat"] = Dict{String, Any}()
-    end
-    for (pkg, compat) in test_compat
-        if pkg ∉ source_pkgs
-            if haskey(merged["compat"], pkg)
-                # Both have compat - keep both constraints (Resolver.jl will find intersection)
-                # For simplicity, we keep the main project's compat if they differ
-                @info "Package $pkg has compat in both projects, using main project's compat"
-            else
-                merged["compat"][pkg] = compat
-                @info "Adding test compat to merged project: $pkg = \"$compat\""
-            end
-        end
-    end
-
-    # Merge weakdeps from test project
-    test_weakdeps = get(test_project, "weakdeps", Dict())
-    if !isempty(test_weakdeps)
-        if !haskey(merged, "weakdeps")
-            merged["weakdeps"] = Dict{String, Any}()
-        end
-        for (pkg, uuid) in test_weakdeps
-            if pkg ∉ source_pkgs && !haskey(merged["weakdeps"], pkg)
-                merged["weakdeps"][pkg] = uuid
-                @info "Adding test weakdep to merged project: $pkg"
-            end
-        end
     end
 
     # Write merged project
@@ -531,26 +558,55 @@ function resolve_directory(
 
     project_file = first(project_files)
     manifest_file = joinpath(dir, "Manifest.toml")
+    project = TOML.parsefile(project_file)
 
-    # Handle packages with [sources] entries (e.g., test/Project.toml referencing main package)
-    # These packages cannot be resolved from the registry, so we temporarily remove them
-    source_pkgs = get_source_packages(project_file)
-    original_content = remove_source_packages_from_project(project_file, source_pkgs)
+    # Check for old-style test dependencies (extras)
+    if haskey(project, "extras") && haskey(project, "targets") && haskey(project["targets"], "test")
+        @info "Project $dir has [extras] and [targets].test, using merged resolution"
+        merged_dir = mktempdir()
+        source_pkgs = create_merged_project(project_file, project_file, merged_dir)
 
-    try
-        @info "Running resolver on $dir with --min=@$resolver_mode"
-        run(`$(Base.julia_cmd()) --project=$resolver_path/bin $resolver_path/bin/resolve.jl $dir --min=@$resolver_mode --julia=$julia_version`)
-        @info "Successfully resolved minimal versions for $dir"
-    finally
-        # Always restore the original Project.toml, even if resolution fails
-        restore_project_file(project_file, original_content)
-    end
+        try
+            @info "Running resolver on merged project (extras) for $dir with --min=@$resolver_mode"
+            run(`$(Base.julia_cmd()) --project=$resolver_path/bin $resolver_path/bin/resolve.jl $merged_dir --min=@$resolver_mode --julia=$julia_version`)
+            @info "Successfully resolved minimal versions for $dir (with extras)"
 
-    # Re-add local path-sourced packages (removed for resolution) to the manifest
-    # so the resolved environment is complete enough to instantiate/build (#3021),
-    # then refresh the project hash so Pkg sees the manifest as up to date.
-    if !isempty(source_pkgs)
-        add_source_packages_to_manifest(manifest_file, project_file, dir, source_pkgs)
+            # Copy manifest back to the project directory
+            merged_manifest = joinpath(merged_dir, "Manifest.toml")
+            if isfile(merged_manifest)
+                cp(merged_manifest, manifest_file; force = true)
+
+                # Add the main package itself and other source packages back to the manifest
+                add_main_package_to_manifest(manifest_file, project_file; path = ".")
+                if !isempty(source_pkgs)
+                    add_source_packages_to_manifest(manifest_file, project_file, dir, source_pkgs)
+                end
+                set_manifest_project_hash(manifest_file, project_file)
+            end
+        finally
+            rm(merged_dir, recursive = true)
+        end
+    else
+        # Handle packages with [sources] entries (e.g., test/Project.toml referencing main package)
+        # These packages cannot be resolved from the registry, so we temporarily remove them
+        source_pkgs = get_source_packages(project_file)
+        original_content = remove_source_packages_from_project(project_file, source_pkgs)
+
+        try
+            @info "Running resolver on $dir with --min=@$resolver_mode"
+            run(`$(Base.julia_cmd()) --project=$resolver_path/bin $resolver_path/bin/resolve.jl $dir --min=@$resolver_mode --julia=$julia_version`)
+            @info "Successfully resolved minimal versions for $dir"
+        finally
+            # Always restore the original Project.toml, even if resolution fails
+            restore_project_file(project_file, original_content)
+        end
+
+        # Re-add local path-sourced packages (removed for resolution) to the manifest
+        # so the resolved environment is complete enough to instantiate/build (#3021),
+        # then refresh the project hash so Pkg sees the manifest as up to date.
+        if !isempty(source_pkgs)
+            add_source_packages_to_manifest(manifest_file, project_file, dir, source_pkgs)
+        end
         set_manifest_project_hash(manifest_file, project_file)
     end
 
