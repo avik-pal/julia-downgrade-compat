@@ -357,12 +357,47 @@ function should_merge_projects(dirs)
 end
 
 """
+    remove_manifest_entries_by_uuid!(manifest, uuid)
+
+Remove from a parsed manifest any package stanza whose `uuid` equals `uuid`,
+returning the names of the packages that were removed. Handles both manifest
+formats: Julia ≥1.7 manifests nest the package tables under a top-level `deps`
+table, while older (≤1.6) manifests place them directly at the top level. Only
+entries matching `uuid` are touched; everything else is left intact.
+"""
+function remove_manifest_entries_by_uuid!(manifest::AbstractDict, uuid::AbstractString)
+    # In ≥1.7 manifests the per-package arrays live under `deps`; in ≤1.6 they
+    # live at the top level alongside metadata keys like `julia_version`.
+    deps = get(manifest, "deps", manifest)
+    removed = String[]
+    for (name, entries) in collect(deps)
+        # Skip metadata scalars present in old-style top-level manifests.
+        entries isa AbstractVector || continue
+        if any(e -> e isa AbstractDict && get(e, "uuid", nothing) == uuid, entries)
+            delete!(deps, name)
+            push!(removed, name)
+        end
+    end
+    return removed
+end
+
+"""
     add_main_package_to_manifest(manifest_file, main_project_file)
 
 Add the main package itself to the manifest as a path dependency.
 This is needed because the main package is excluded from resolution
 (it's a local source), but the manifest needs to include it for
 workspace projects to work correctly.
+
+If the resolver already emitted a registry entry for the main package, that
+entry is removed first. This happens in the merged-resolution path whenever a
+test extra transitively depends on the main package (e.g. LinearSolve's test
+extra AlgebraicMultigrid depends on LinearSolve): the merged resolve installs
+the main package from the registry, so blindly appending the path stanza would
+leave two `[[deps.<MainPkg>]]` entries with the same name and uuid. Pkg then
+rejects the manifest with "Invalid manifest format: ...'s dependency on
+<MainPkg> is ambiguous". The path entry must win, since the main package is
+sourced locally, not from the registry.
 """
 function add_main_package_to_manifest(manifest_file::String, main_project_file::String; path::String = ".")
     if !isfile(manifest_file)
@@ -380,6 +415,18 @@ function add_main_package_to_manifest(manifest_file::String, main_project_file::
     if pkg_name === nothing || pkg_uuid === nothing
         @warn "Main project missing name or uuid, cannot add to manifest"
         return
+    end
+
+    # Drop any resolver-emitted entry for the main package (matched by uuid, so
+    # a renamed-but-same-package stanza is still caught) before appending the
+    # path stanza; a duplicate would make the manifest invalid.
+    manifest = TOML.parsefile(manifest_file)
+    removed = remove_manifest_entries_by_uuid!(manifest, pkg_uuid)
+    if !isempty(removed)
+        open(manifest_file, "w") do io
+            TOML.print(io, manifest; sorted = true)
+        end
+        @info "Removed resolver-emitted registry entry for main package $pkg_name"
     end
 
     # Read the manifest content as text to preserve formatting

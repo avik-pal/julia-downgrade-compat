@@ -816,4 +816,70 @@ end
             end
         end
     end
+
+    @testset "merged resolution: test extra depending on the main package" begin
+        # Regression for the duplicate main-package manifest entry. When a
+        # project uses [extras]+[targets].test and a test extra transitively
+        # depends on the main package, the merged resolve installs the main
+        # package FROM THE REGISTRY too. add_main_package_to_manifest then has
+        # to replace that registry stanza with the path stanza; blindly
+        # appending it leaves two [[deps.<MainPkg>]] entries with the same uuid,
+        # and Pkg rejects the manifest with "Invalid manifest format: ...'s
+        # dependency on <MainPkg> is ambiguous" (exit 1) at set_manifest_project_hash.
+        #
+        # Mirrors SciML/LinearSolve.jl, whose test extra AlgebraicMultigrid
+        # depends on LinearSolve. Here the registered pair
+        # DataStructures -> OrderedCollections plays the same roles, with the
+        # local package masquerading as the registered OrderedCollections so the
+        # resolver emits a registry entry under the main package's uuid. The
+        # current runtime julia_version ("1") is used because the resolver
+        # currently fails cross-runtime resolution for [sources]/path projects.
+        mktempdir() do dir
+            cd(dir) do
+                toml_content = """
+                name = "OrderedCollections"
+                uuid = "bac558e1-5e72-5ebc-8fee-abe8a469f55d"
+                version = "1.6.0"
+
+                [deps]
+
+                [extras]
+                DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
+
+                [compat]
+                julia = "1.10"
+                DataStructures = "0.18"
+
+                [targets]
+                test = ["DataStructures"]
+                """
+                write("Project.toml", toml_content)
+                mkdir("src")
+                write("src/OrderedCollections.jl", "module OrderedCollections\nend\n")
+
+                # Before the fix this exits 1 with the "ambiguous" manifest error.
+                run(`$(Base.julia_cmd()) $downgrade_jl "" "." "deps" "1"`)
+
+                @test isfile("Manifest.toml")
+
+                # (a) The manifest must re-parse via Pkg (it rejects duplicate
+                # name/uuid stanzas with the ambiguity error).
+                Pkg.Types.EnvCache("Project.toml")
+
+                manifest = TOML.parsefile("Manifest.toml")
+                deps = manifest["deps"]
+
+                # The test extra and its transitive dep are present.
+                @test haskey(deps, "DataStructures")
+
+                # (b) Exactly one stanza for the main package, and it is the path
+                # entry pointing at the project dir, not the registry stanza.
+                main_entries = get(deps, "OrderedCollections", [])
+                @test length(main_entries) == 1
+                @test main_entries[1]["path"] == "."
+                @test main_entries[1]["uuid"] == "bac558e1-5e72-5ebc-8fee-abe8a469f55d"
+                @test main_entries[1]["version"] == "1.6.0"
+            end
+        end
+    end
 end
