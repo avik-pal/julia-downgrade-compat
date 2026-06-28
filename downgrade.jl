@@ -234,6 +234,24 @@ function create_merged_project(main_project_file::String, test_project_file::Str
     # Remove workspace section (not needed for resolution)
     delete!(merged, "workspace")
 
+    # Strip in-tree [sources] path/url packages from the merged project. They are
+    # not registered, so if they remain in [deps]/[compat]/[sources] the resolver
+    # errors "unknown package UUID: ..." (e.g. a monorepo root whose [deps] are its
+    # own unregistered lib/* sources). The merge logic below already skips ADDING
+    # source packages from extras/test-deps, but a source package listed directly
+    # in the main project's [deps] (a monorepo root depending on its siblings)
+    # would otherwise survive the deepcopy. This mirrors the non-merged path's
+    # remove_source_packages_from_project. They are re-added to the manifest as
+    # path deps after resolution (add_source_packages_to_manifest).
+    for section_name in ("deps", "compat", "sources")
+        if haskey(merged, section_name)
+            for pkg in source_pkgs
+                delete!(merged[section_name], pkg)
+            end
+            isempty(merged[section_name]) && delete!(merged, section_name)
+        end
+    end
+
     # Merge extras from main project into deps (old-style test dependencies)
     # This ensures that even in the "new style" with test/Project.toml, any
     # legacy extras in the root project that might still be used are included.

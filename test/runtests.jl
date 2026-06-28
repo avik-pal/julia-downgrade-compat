@@ -882,4 +882,93 @@ end
             end
         end
     end
+
+    @testset "merged resolution: source sibling in main [deps] (monorepo root)" begin
+        # Regression for SciML/OptimalUncertaintyQuantification.jl Downgrade Core /
+        # Downgrade Sublibraries. A monorepo ROOT (or a sublibrary) lists an
+        # unregistered in-repo sibling directly in its main [deps] and pins it via
+        # [sources], AND uses [extras]+[targets].test (merged resolution path).
+        # create_merged_project starts from deepcopy(main_project), which retains
+        # the sibling in [deps]/[compat]/[sources]; the resolver then errors
+        # "unknown package UUID: <sibling>" before resolving anything. The merged
+        # project must strip source packages from [deps]/[compat]/[sources], the
+        # same way the non-merged path does.
+        mktempdir() do dir
+            cd(dir) do
+                # Unregistered in-repo sibling with a made-up uuid.
+                mkpath("lib/MySib/src")
+                write(
+                    "lib/MySib/Project.toml",
+                    """
+                    name = "MySib"
+                    uuid = "11111111-2222-3333-4444-555555555555"
+                    version = "0.1.0"
+                    """
+                )
+                write("lib/MySib/src/MySib.jl", "module MySib\nend\n")
+
+                # Root package depends on the sibling (in [deps], pinned via
+                # [sources]) plus a real registry dep, and declares old-style test
+                # deps via [extras]/[targets].test to force the merged path.
+                write(
+                    "Project.toml",
+                    """
+                    name = "RootPkg"
+                    uuid = "598b003f-0677-49cf-8d2a-39b1658b755a"
+                    version = "0.1.0"
+
+                    [deps]
+                    MySib = "11111111-2222-3333-4444-555555555555"
+                    JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+
+                    [extras]
+                    DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
+
+                    [compat]
+                    julia = "1.10"
+                    MySib = "0.1"
+                    JSON = "0.20, 0.21"
+                    DataStructures = "0.17, 0.18"
+
+                    [sources]
+                    MySib = { path = "lib/MySib" }
+
+                    [targets]
+                    test = ["DataStructures"]
+                    """
+                )
+                mkdir("src")
+                write("src/RootPkg.jl", "module RootPkg\nusing MySib\nend\n")
+
+                # Before the fix this exits 1 with
+                # "unknown package UUID: 11111111-...". MySib is in the skip list
+                # (the workflow skips [sources] names), but that only prevents
+                # compat-rewriting -- the resolver still chokes on it in [deps].
+                run(`$(Base.julia_cmd()) $downgrade_jl "MySib" "." "deps" "1.10"`)
+
+                @test isfile("Manifest.toml")
+                # Manifest must re-parse via Pkg.
+                Pkg.Types.EnvCache("Project.toml")
+
+                manifest = TOML.parsefile("Manifest.toml")
+                deps = manifest["deps"]
+
+                # Registry dep was minimized.
+                deps_JSON = get(deps, "JSON", [])
+                @test !isempty(deps_JSON)
+                @test startswith(deps_JSON[1]["version"], "0.20")
+
+                # The source sibling is re-added to the manifest as a path dep.
+                deps_MySib = get(deps, "MySib", [])
+                @test !isempty(deps_MySib)
+                @test deps_MySib[1]["path"] == joinpath("lib", "MySib")
+                @test deps_MySib[1]["uuid"] == "11111111-2222-3333-4444-555555555555"
+
+                # The original Project.toml is restored (still lists the source).
+                restored = TOML.parsefile("Project.toml")
+                @test haskey(restored["deps"], "MySib")
+                @test haskey(restored, "sources") && haskey(restored["sources"], "MySib")
+            end
+        end
+    end
 end
