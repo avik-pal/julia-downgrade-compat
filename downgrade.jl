@@ -7,6 +7,15 @@ dirs = filter(!isempty, map(strip, split(ARGS[2], ",")))
 mode = length(ARGS) >= 3 ? ARGS[3] : "deps"
 current_julia_minor = string(VERSION.major, ".", VERSION.minor)
 julia_version = length(ARGS) >= 4 ? ARGS[4] : current_julia_minor
+# Weakdep extensions to keep as weakdeps in the merged project instead of
+# promoting them to hard [deps]. The merged resolution otherwise force-min-
+# resolves every promoted weakdep together (the extensions all coexist in one
+# test env, so testing them together is correct); use this only to exclude a
+# backend that is currently unresolvable on its own -- e.g. Mooncake, whose graph
+# Resolver.jl cannot --min-resolve (StefanKarpinski/Resolver.jl#24). The excluded
+# backend stays a weakdep (installed at latest), every other extension is still
+# floor-tested jointly.
+no_promote = length(ARGS) >= 5 ? filter(!isempty, map(strip, split(ARGS[5], ","))) : String[]
 
 # The resolver only accepts numeric compat specs, so setup-julia channel
 # aliases ("lts", "pre", "min", "nightly", ...) must be converted to a numeric
@@ -218,7 +227,8 @@ both environments), the resolved versions are compatible.
 
 Returns a Set of source packages that were excluded from the merge.
 """
-function create_merged_project(main_project_file::String, test_project_file::String, merged_dir::String)
+function create_merged_project(main_project_file::String, test_project_file::String, merged_dir::String;
+        no_promote = String[])
     main_project = TOML.parsefile(main_project_file)
     test_project = TOML.parsefile(test_project_file)
 
@@ -257,10 +267,21 @@ function create_merged_project(main_project_file::String, test_project_file::Str
     # legacy extras in the root project that might still be used are included.
     # For the "old style" case where test_project_file == main_project_file,
     # this is where the test dependencies are actually added to [deps].
+    main_weakdeps = get(main_project, "weakdeps", Dict())
     if haskey(main_project, "extras")
         deps = get!(merged, "deps", Dict{String, Any}())
         for (pkg, uuid) in main_project["extras"]
             if pkg ∉ source_pkgs
+                # A weakdep extension named in `no_promote` is left as a weakdep
+                # (installed at latest, never force-min-resolved), instead of being
+                # promoted into the joint floor-resolve. Used to exclude a backend
+                # that is currently unresolvable on its own (e.g. Mooncake); every
+                # other extension is still promoted and floor-tested together.
+                if pkg in no_promote && haskey(main_weakdeps, pkg)
+                    @info "Keeping $pkg as a weakdep in merged project (listed in no_promote)"
+                    continue
+                end
+
                 if !haskey(deps, pkg)
                     deps[pkg] = uuid
                     @info "Adding main project extra to merged project: $pkg"
@@ -607,7 +628,7 @@ function add_source_packages_to_manifest(
 end
 
 """
-    resolve_directory(dir, resolver_path, resolver_mode, julia_version, mode, ignore_pkgs)
+    resolve_directory(dir, resolver_path, resolver_mode, julia_version, mode, ignore_pkgs, no_promote)
 
 Resolve dependencies for a single directory. Handles source packages by temporarily
 removing them from the project file, running the resolver, and then restoring the original.
@@ -615,7 +636,8 @@ Returns the source packages found in the directory (for use in forcedeps checkin
 """
 function resolve_directory(
         dir::AbstractString, resolver_path::AbstractString, resolver_mode::AbstractString,
-        julia_version::AbstractString, mode::AbstractString, ignore_pkgs)
+        julia_version::AbstractString, mode::AbstractString, ignore_pkgs,
+        no_promote = String[])
     project_files = [joinpath(dir, "Project.toml"), joinpath(dir, "JuliaProject.toml")]
     filter!(isfile, project_files)
     isempty(project_files) &&
@@ -629,7 +651,7 @@ function resolve_directory(
     if haskey(project, "extras") && haskey(project, "targets") && haskey(project["targets"], "test")
         @info "Project $dir has [extras] and [targets].test, using merged resolution"
         merged_dir = mktempdir()
-        source_pkgs = create_merged_project(project_file, project_file, merged_dir)
+        source_pkgs = create_merged_project(project_file, project_file, merged_dir; no_promote)
 
         try
             @info "Running resolver on merged project (extras) for $dir with --min=@$resolver_mode"
@@ -920,7 +942,7 @@ if do_merge
 
     # Create merged project in temp directory
     merged_dir = mktempdir()
-    source_pkgs = create_merged_project(main_project_file, test_project_file, merged_dir)
+    source_pkgs = create_merged_project(main_project_file, test_project_file, merged_dir; no_promote)
 
     # Run resolver on merged project
     @info "Running resolver on merged project with --min=@$resolver_mode"
@@ -985,12 +1007,12 @@ if do_merge
     other_dirs = filter(d -> normpath(d) != main_dir && normpath(d) != test_dir, dirs)
     for dir in other_dirs
         resolve_directory(
-            dir, resolver_path, resolver_mode, julia_version, mode, ignore_pkgs)
+            dir, resolver_path, resolver_mode, julia_version, mode, ignore_pkgs, no_promote)
     end
 else
     # Independent resolution: process each directory separately
     for dir in dirs
         resolve_directory(
-            dir, resolver_path, resolver_mode, julia_version, mode, ignore_pkgs)
+            dir, resolver_path, resolver_mode, julia_version, mode, ignore_pkgs, no_promote)
     end
 end

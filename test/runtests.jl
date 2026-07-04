@@ -971,4 +971,69 @@ end
             end
         end
     end
+
+    @testset "no_promote keeps a named weakdep extension out of the joint resolve" begin
+        # The merged resolution promotes every weakdep test-extra into ONE joint
+        # floor-resolve -- correct, because the extensions coexist in a single test
+        # env. A backend that is currently unresolvable on its own (here a nonexistent
+        # floor, standing in for Mooncake, whose graph Resolver.jl cannot --min-resolve)
+        # makes that joint resolve fail. Naming it in `no_promote` (the 5th arg) keeps
+        # it a weakdep so it is never promoted; the joint resolve then succeeds and
+        # every OTHER extension is still floor-tested together.
+        write_repro() = begin
+            write(
+                "Project.toml",
+                """
+                name = "ReproPkg"
+                uuid = "598b003f-0677-49cf-8d2a-39b1658b755a"
+                version = "0.1.0"
+
+                [deps]
+                DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
+
+                [weakdeps]
+                JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+
+                [extensions]
+                ReproJSONExt = "JSON"
+
+                [compat]
+                julia = "1.10"
+                DataStructures = "0.17, 0.18"
+                JSON = "0.999"
+
+                [extras]
+                JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+
+                [targets]
+                test = ["JSON"]
+                """,
+            )
+            mkdir("src")
+            write("src/ReproPkg.jl", "module ReproPkg\nend\n")
+        end
+
+        # Without no_promote: JSON is promoted, and its unsatisfiable floor fails the run.
+        mktempdir() do dir
+            cd(dir) do
+                write_repro()
+                @test_throws ProcessFailedException run(
+                    pipeline(`$(Base.julia_cmd()) $downgrade_jl "" "." "deps" "1.10"`;
+                        stdout = devnull, stderr = devnull))
+            end
+        end
+
+        # With no_promote=JSON: JSON stays a weakdep, the joint resolve succeeds, and
+        # JSON is absent from the resolved [deps] (DataStructures is still minimized).
+        mktempdir() do dir
+            cd(dir) do
+                write_repro()
+                run(`$(Base.julia_cmd()) $downgrade_jl "" "." "deps" "1.10" "JSON"`)
+                @test isfile("Manifest.toml")
+                deps = TOML.parsefile("Manifest.toml")["deps"]
+                @test startswith(deps["DataStructures"][1]["version"], "0.17")
+                @test !haskey(deps, "JSON")
+            end
+        end
+    end
 end
