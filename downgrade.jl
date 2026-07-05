@@ -267,18 +267,20 @@ function create_merged_project(main_project_file::String, test_project_file::Str
     # legacy extras in the root project that might still be used are included.
     # For the "old style" case where test_project_file == main_project_file,
     # this is where the test dependencies are actually added to [deps].
-    main_weakdeps = get(main_project, "weakdeps", Dict())
     if haskey(main_project, "extras")
         deps = get!(merged, "deps", Dict{String, Any}())
         for (pkg, uuid) in main_project["extras"]
             if pkg ∉ source_pkgs
-                # A weakdep extension named in `no_promote` is left as a weakdep
-                # (installed at latest, never force-min-resolved), instead of being
-                # promoted into the joint floor-resolve. Used to exclude a backend
-                # that is currently unresolvable on its own (e.g. Mooncake); every
-                # other extension is still promoted and floor-tested together.
-                if pkg in no_promote && haskey(main_weakdeps, pkg)
-                    @info "Keeping $pkg as a weakdep in merged project (listed in no_promote)"
+                # An extra named in `no_promote` is NOT promoted into the merged
+                # [deps], so it is excluded from the joint floor-resolve. A weakdep
+                # extra stays a weakdep; a pure test extra stays in [extras]; either
+                # way it is installed at latest and never force-min-resolved. Used to
+                # exclude a backend that is currently unresolvable on its own (e.g.
+                # Mooncake); every other extension is still promoted and floor-tested
+                # together. (Not gated on [weakdeps] membership: some repos list an AD
+                # backend only in [extras]/[targets].test with no [weakdeps] section.)
+                if pkg in no_promote
+                    @info "Not promoting $pkg into merged [deps] (listed in no_promote)"
                     continue
                 end
 

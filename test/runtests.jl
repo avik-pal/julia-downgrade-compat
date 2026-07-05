@@ -1036,4 +1036,61 @@ end
             end
         end
     end
+
+    @testset "no_promote also excludes a PURE test-extra (no [weakdeps])" begin
+        # Some repos list an AD backend only in [extras]/[targets].test with NO
+        # [weakdeps] section (e.g. Optimization.jl's root). `no_promote` must exclude
+        # it from promotion too, not just weakdep extras -- otherwise the joint resolve
+        # still promotes the unresolvable backend. Here JSON is a pure extra (no
+        # [weakdeps]/[extensions]) with a nonexistent floor.
+        write_repro() = begin
+            write(
+                "Project.toml",
+                """
+                name = "ReproPkg"
+                uuid = "598b003f-0677-49cf-8d2a-39b1658b755a"
+                version = "0.1.0"
+
+                [deps]
+                DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
+
+                [compat]
+                julia = "1.10"
+                DataStructures = "0.17, 0.18"
+                JSON = "0.999"
+
+                [extras]
+                JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+
+                [targets]
+                test = ["JSON"]
+                """,
+            )
+            mkdir("src")
+            write("src/ReproPkg.jl", "module ReproPkg\nend\n")
+        end
+
+        # Without no_promote: the pure extra JSON is promoted -> unsatisfiable -> fails.
+        mktempdir() do dir
+            cd(dir) do
+                write_repro()
+                @test_throws ProcessFailedException run(
+                    pipeline(`$(Base.julia_cmd()) $downgrade_jl "" "." "deps" "1.10"`;
+                        stdout = devnull, stderr = devnull))
+            end
+        end
+
+        # With no_promote=JSON: the pure extra is not promoted, the resolve succeeds,
+        # and JSON is absent from the resolved [deps].
+        mktempdir() do dir
+            cd(dir) do
+                write_repro()
+                run(`$(Base.julia_cmd()) $downgrade_jl "" "." "deps" "1.10" "JSON"`)
+                @test isfile("Manifest.toml")
+                deps = TOML.parsefile("Manifest.toml")["deps"]
+                @test startswith(deps["DataStructures"][1]["version"], "0.17")
+                @test !haskey(deps, "JSON")
+            end
+        end
+    end
 end
