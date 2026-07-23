@@ -123,6 +123,38 @@ For Julia `>= 1.12`, using `julia-actions/julia-runtest` with
 When possible, run the action on the same Julia version that you pass as `julia_version`.
 Cross-runtime resolution may fail; matching runtime and target version is recommended and the default for `julia_version`.
 
+### Local path sources
+
+For a dependency configured with `[sources]` and `path`, including one selected
+only by `[targets].test`, the action includes hard registry dependencies that
+are declared by the local package but missing from the active project in the
+minimum-version resolution. It follows active path sources recursively, so
+local monorepo dependencies remain local throughout the locked build and test.
+Dependencies already declared by the active project retain their UUID and have
+their compat intersected with the local packages' constraints. If the root and
+local constraints, or constraints from two local packages, do not overlap, the
+action reports the conflict before producing a locked manifest.
+
+When a local path package appears only in `[targets].test`, Julia 1.11 and newer
+honor its `[sources]` entry but resolve its dependency graph independently while
+constructing the `Pkg.test` sandbox. This can upgrade a dependency above the
+locked minimum even with `allow_reresolve=false`. The action therefore promotes
+the test-only path graph's hard non-local dependencies to root `[deps]` in the
+checkout. The local package itself remains a test dependency. A weak-only test
+source is added to `[extras]` because Pkg requires every `[sources]` entry to
+appear in `[deps]` or `[extras]`; its `[weakdeps]` entry remains intact.
+
+Julia 1.10 and earlier do not honor `[sources]` while constructing the
+`Pkg.test` sandbox. On those versions, the action also promotes test-only path
+packages to `[deps]` in the checkout so the locked test can use them. Weak-only
+test packages are also removed from `[weakdeps]` as part of that compatibility
+fallback.
+
+These promotions intentionally leave `Project.toml` modified for subsequent
+locked build and test steps.
+
+This support does not promote path-package weak dependencies.
+
 ## Downgrade Modes
 
 - **`deps`**: Minimize only your direct dependencies (recommended for most packages)

@@ -441,55 +441,183 @@ end
             cd(dir) do
                 # Sibling package that is dev'd via a local path source.
                 mkdir("DevTool")
-                write("DevTool/Project.toml", """
-                name = "DevTool"
-                uuid = "11111111-1111-1111-1111-111111111111"
-                version = "0.1.0"
-                """)
+                write(
+                    "DevTool/Project.toml", """
+                    name = "DevTool"
+                    uuid = "11111111-1111-1111-1111-111111111111"
+                    version = "0.1.0"
+
+                    [deps]
+                    DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
+
+                    [compat]
+                    DataStructures = "0.18"
+                    """
+                )
                 mkdir("DevTool/src")
-                write("DevTool/src/DevTool.jl", "module DevTool\nend\n")
+                write(
+                    "DevTool/src/DevTool.jl",
+                    "module DevTool\n" *
+                        "using DataStructures\n" *
+                        "loaded() = OrderedDict(:ok => true)[:ok]\n" *
+                        "dependency_version() = Base.pkgversion(DataStructures)\n" *
+                        "end\n"
+                )
+
+                mkdir("WeakTool")
+                write(
+                    "WeakTool/Project.toml", """
+                    name = "WeakTool"
+                    uuid = "77777777-7777-7777-7777-777777777777"
+                    version = "0.1.0"
+                    """
+                )
+                mkdir("WeakTool/src")
+                write(
+                    "WeakTool/src/WeakTool.jl",
+                    "module WeakTool\nloaded() = true\nend\n"
+                )
 
                 # Package under test: a registry dep plus a path-sourced test dep
                 # that is referenced from [targets].
                 mkdir("SubPackage")
-                write("SubPackage/Project.toml", """
-                name = "SubPackage"
-                uuid = "22222222-2222-2222-2222-222222222222"
-                version = "0.1.0"
+                write(
+                    "SubPackage/Project.toml", """
+                    name = "SubPackage"
+                    uuid = "22222222-2222-2222-2222-222222222222"
+                    version = "0.1.0"
 
-                [deps]
-                JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+                    [deps]
+                    JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 
-                [extras]
-                DevTool = "11111111-1111-1111-1111-111111111111"
-                Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+                    [extras]
+                    DevTool = "11111111-1111-1111-1111-111111111111"
+                    Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+                    WeakTool = "77777777-7777-7777-7777-777777777777"
 
-                [sources]
-                DevTool = {path = "../DevTool"}
+                    [weakdeps]
+                    WeakTool = "77777777-7777-7777-7777-777777777777"
 
-                [compat]
-                julia = "1.10"
-                JSON = "0.20, 0.21"
+                    [sources]
+                    DevTool = {path = "../DevTool"}
+                    WeakTool = {path = "../WeakTool"}
 
-                [targets]
-                test = ["DevTool", "Test"]
-                """)
+                    [compat]
+                    julia = "1.10"
+                    JSON = "0.20, 0.21"
+
+                    [targets]
+                    test = ["DevTool", "Test", "WeakTool"]
+                    """
+                )
+                mkdir("SubPackage/src")
+                write("SubPackage/src/SubPackage.jl", "module SubPackage\nend\n")
+                mkdir("SubPackage/test")
+                write(
+                    "SubPackage/test/runtests.jl",
+                    "using DevTool, Test, WeakTool\n" *
+                        "@test DevTool.loaded()\n" *
+                        "@test DevTool.dependency_version() == v\"0.18.0\"\n" *
+                        "@test WeakTool.loaded()\n"
+                )
+
+                original_project = read(joinpath("SubPackage", "Project.toml"), String)
 
                 # Before the fix this throws a ProcessFailedException.
-                run(`$(Base.julia_cmd()) $downgrade_jl "" "SubPackage" "deps" "1.10"`)
+                run(`$(Base.julia_cmd()) $downgrade_jl "" "SubPackage" "deps" "1"`)
 
                 @test isfile(joinpath("SubPackage", "Manifest.toml"))
                 manifest = TOML.parsefile(joinpath("SubPackage", "Manifest.toml"))
                 deps_JSON = get(manifest["deps"], "JSON", [])
                 @test !isempty(deps_JSON)
                 @test startswith(deps_JSON[1]["version"], "0.20")
+                @test only(manifest["deps"]["DataStructures"])["version"] == "0.18.0"
+                devtool = only(manifest["deps"]["DevTool"])
+                @test devtool["path"] == "../DevTool"
+                @test Set(devtool["deps"]) == Set(["DataStructures"])
+                @test only(manifest["deps"]["WeakTool"])["path"] == "../WeakTool"
+                expected_main_deps = VERSION >= v"1.11" ?
+                                     Set(["DataStructures", "JSON"]) :
+                                     Set(["DevTool", "JSON", "WeakTool"])
+                @test Set(only(manifest["deps"]["SubPackage"])["deps"]) ==
+                    expected_main_deps
+                run(`$(Base.julia_cmd()) --project=SubPackage -e 'using Pkg; Pkg.test(; allow_reresolve = false)'`)
 
-                # The original Project.toml must be restored verbatim, including
-                # the [targets] and [sources] entries that were stripped.
                 restored = TOML.parsefile(joinpath("SubPackage", "Project.toml"))
-                @test restored["targets"]["test"] == ["DevTool", "Test"]
+                @test restored["targets"]["test"] == ["DevTool", "Test", "WeakTool"]
                 @test haskey(restored["sources"], "DevTool")
+                @test haskey(restored["sources"], "WeakTool")
                 @test haskey(restored["extras"], "DevTool")
+                @test haskey(restored["extras"], "WeakTool")
+                if VERSION >= v"1.11"
+                    @test read(joinpath("SubPackage", "Project.toml"), String) !=
+                        original_project
+                    @test restored["deps"]["DataStructures"] ==
+                        "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
+                    @test !haskey(restored["deps"], "DevTool")
+                    @test !haskey(restored["deps"], "WeakTool")
+                    @test haskey(restored, "weakdeps")
+                else
+                    @test restored["deps"]["DevTool"] ==
+                        "11111111-1111-1111-1111-111111111111"
+                    @test restored["deps"]["WeakTool"] ==
+                        "77777777-7777-7777-7777-777777777777"
+                    @test !haskey(restored, "weakdeps")
+                end
+
+                mkdir("WeakOnlyPackage")
+                write(
+                    "WeakOnlyPackage/Project.toml", """
+                    name = "WeakOnlyPackage"
+                    uuid = "88888888-8888-8888-8888-888888888888"
+                    version = "0.1.0"
+
+                    [weakdeps]
+                    WeakTool = "77777777-7777-7777-7777-777777777777"
+
+                    [sources]
+                    WeakTool = {path = "../WeakTool"}
+
+                    [compat]
+                    julia = "1.10"
+                    WeakTool = "0.1"
+
+                    [targets]
+                    test = ["WeakTool"]
+                    """
+                )
+                mkdir("WeakOnlyPackage/src")
+                write(
+                    "WeakOnlyPackage/src/WeakOnlyPackage.jl",
+                    "module WeakOnlyPackage\nend\n"
+                )
+                mkdir("WeakOnlyPackage/test")
+                write(
+                    "WeakOnlyPackage/test/runtests.jl",
+                    "using WeakTool\nWeakTool.loaded() || error(\"WeakTool failed to load\")\n"
+                )
+
+                original_weak_project =
+                    read(joinpath("WeakOnlyPackage", "Project.toml"), String)
+
+                run(`$(Base.julia_cmd()) $downgrade_jl "" "WeakOnlyPackage" "deps" "1"`)
+                run(`$(Base.julia_cmd()) --project=WeakOnlyPackage -e 'using Pkg; Pkg.test(; allow_reresolve = false)'`)
+                weak_only = TOML.parsefile(joinpath("WeakOnlyPackage", "Project.toml"))
+                if VERSION >= v"1.11"
+                    @test read(joinpath("WeakOnlyPackage", "Project.toml"), String) !=
+                        original_weak_project
+                    @test !haskey(weak_only, "deps")
+                    @test weak_only["extras"]["WeakTool"] ==
+                        "77777777-7777-7777-7777-777777777777"
+                    @test weak_only["weakdeps"]["WeakTool"] ==
+                        "77777777-7777-7777-7777-777777777777"
+                else
+                    @test weak_only["deps"]["WeakTool"] ==
+                        "77777777-7777-7777-7777-777777777777"
+                    @test weak_only["extras"]["WeakTool"] ==
+                        "77777777-7777-7777-7777-777777777777"
+                    @test !haskey(weak_only, "weakdeps")
+                end
             end
         end
     end
@@ -503,32 +631,53 @@ end
             cd(dir) do
                 # Locally-developed dependency referenced by path.
                 mkdir("CorePkg")
-                write("CorePkg/Project.toml", """
-                name = "CorePkg"
-                uuid = "33333333-3333-3333-3333-333333333333"
-                version = "1.2.3"
-                """)
+                write(
+                    "CorePkg/Project.toml", """
+                    name = "CorePkg"
+                    uuid = "33333333-3333-3333-3333-333333333333"
+                    version = "1.2.3"
+
+                    [weakdeps]
+                    JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+
+                    [extensions]
+                    CorePkgJSONExt = "JSON"
+                    """
+                )
                 mkdir("CorePkg/src")
-                write("CorePkg/src/CorePkg.jl", "module CorePkg\nend\n")
+                write(
+                    "CorePkg/src/CorePkg.jl",
+                    "module CorePkg\nfunction extension_loaded end\nend\n"
+                )
+                mkdir("CorePkg/ext")
+                write(
+                    "CorePkg/ext/CorePkgJSONExt.jl",
+                    "module CorePkgJSONExt\n" *
+                        "using CorePkg, JSON\n" *
+                        "CorePkg.extension_loaded() = true\n" *
+                        "end\n"
+                )
 
                 # Package under test: a registry dep plus a path-sourced dep in [deps].
                 mkdir("SubPackage")
-                write("SubPackage/Project.toml", """
-                name = "SubPackage"
-                uuid = "44444444-4444-4444-4444-444444444444"
-                version = "0.1.0"
+                write(
+                    "SubPackage/Project.toml", """
+                    name = "SubPackage"
+                    uuid = "44444444-4444-4444-4444-444444444444"
+                    version = "0.1.0"
 
-                [deps]
-                JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
-                CorePkg = "33333333-3333-3333-3333-333333333333"
+                    [deps]
+                    JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+                    CorePkg = "33333333-3333-3333-3333-333333333333"
 
-                [sources]
-                CorePkg = {path = "../CorePkg"}
+                    [sources]
+                    CorePkg = {path = "../CorePkg"}
 
-                [compat]
-                julia = "1.10"
-                JSON = "0.20, 0.21"
-                """)
+                    [compat]
+                    julia = "1.10"
+                    JSON = "0.20, 0.21"
+                    """
+                )
 
                 run(`$(Base.julia_cmd()) $downgrade_jl "" "SubPackage" "deps" "1.10"`)
 
@@ -548,10 +697,14 @@ end
                 @test core_entry[1]["path"] == "../CorePkg"
                 @test core_entry[1]["uuid"] == "33333333-3333-3333-3333-333333333333"
                 @test core_entry[1]["version"] == "1.2.3"
+                @test core_entry[1]["extensions"]["CorePkgJSONExt"] == "JSON"
+                @test core_entry[1]["weakdeps"]["JSON"] ==
+                    "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+                run(`$(Base.julia_cmd()) --project=SubPackage -e 'using CorePkg, JSON; CorePkg.extension_loaded() || error("path-source extension did not load")'`)
 
                 # Project hash matches what Pkg expects for the restored project.
                 @test manifest["project_hash"] ==
-                      expected_project_hash(joinpath(dir, "SubPackage", "Project.toml"))
+                    expected_project_hash(joinpath(dir, "SubPackage", "Project.toml"))
             end
         end
     end
@@ -968,6 +1121,578 @@ end
                 restored = TOML.parsefile("Project.toml")
                 @test haskey(restored["deps"], "MySib")
                 @test haskey(restored, "sources") && haskey(restored["sources"], "MySib")
+            end
+        end
+    end
+
+    @testset "direct path-source runtime dependencies participate in minimum resolution" begin
+        mktempdir() do dir
+            cd(dir) do
+                mkpath("LocalA/src")
+                write(
+                    "LocalA/Project.toml",
+                    """
+                    name = "LocalA"
+                    uuid = "11111111-1111-1111-1111-111111111111"
+                    version = "0.1.0"
+
+                    [deps]
+                    DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
+                    JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+                    Preferences = "21216c6a-2e73-6563-6e65-726566657250"
+                    StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+
+                    [compat]
+                    DataStructures = "0.18"
+                    julia = "1.10"
+                    JSON = "0.21"
+                    Preferences = "1.4.0"
+                    StaticArrays = "1.8, 1.9"
+                    """
+                )
+                write(
+                    "LocalA/src/LocalA.jl",
+                    "module LocalA\nusing DataStructures, JSON, Preferences, StaticArrays\nend\n"
+                )
+
+                mkpath("LocalB/src")
+                write(
+                    "LocalB/Project.toml",
+                    """
+                    name = "LocalB"
+                    uuid = "22222222-2222-2222-2222-222222222222"
+                    version = "0.1.0"
+
+                    [deps]
+                    Preferences = "21216c6a-2e73-6563-6e65-726566657250"
+                    StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+
+                    [compat]
+                    julia = "1.10"
+                    Preferences = "1"
+                    StaticArrays = "1.9.8"
+                    """
+                )
+                write(
+                    "LocalB/src/LocalB.jl",
+                    "module LocalB\nusing Preferences, StaticArrays\nend\n"
+                )
+
+                mkpath("src")
+                mkpath("test")
+                write("src/RootPkg.jl", "module RootPkg\nusing LocalA, LocalB\nend\n")
+                write(
+                    "test/runtests.jl",
+                    "using Test, BenchmarkTools, RootPkg\n@test true\n"
+                )
+                write(
+                    "Project.toml",
+                    """
+                    name = "RootPkg"
+                    uuid = "33333333-3333-3333-3333-333333333333"
+                    version = "0.1.0"
+
+                    [deps]
+                    JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+                    LocalA = "11111111-1111-1111-1111-111111111111"
+                    LocalB = "22222222-2222-2222-2222-222222222222"
+
+                    [sources]
+                    LocalA = {path = "LocalA"}
+                    LocalB = {path = "LocalB"}
+
+                    [compat]
+                    julia = "1.10"
+                    BenchmarkTools = "1.5.0"
+                    JSON = "0.21.4"
+                    LocalA = "0.1"
+                    LocalB = "0.1"
+
+                    [weakdeps]
+                    DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
+
+                    [extras]
+                    BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
+                    Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+                    [targets]
+                    test = ["BenchmarkTools", "Test"]
+                    """
+                )
+
+                run(`$(Base.julia_cmd()) $downgrade_jl "" "." "alldeps" "1"`)
+
+                manifest = TOML.parsefile("Manifest.toml")
+                deps = manifest["deps"]
+                @test only(deps["DataStructures"])["version"] == "0.18.0"
+                @test only(deps["Preferences"])["version"] == "1.4.0"
+                @test only(deps["StaticArrays"])["version"] == "1.9.8"
+                @test only(deps["JSON"])["version"] == "0.21.4"
+                @test only(deps["BenchmarkTools"])["version"] == "1.5.0"
+                local_a = only(deps["LocalA"])
+                local_b = only(deps["LocalB"])
+                @test local_a["path"] == "LocalA"
+                @test Set(local_a["deps"]) ==
+                    Set(["DataStructures", "JSON", "Preferences", "StaticArrays"])
+                @test local_b["path"] == "LocalB"
+                @test Set(local_b["deps"]) == Set(["Preferences", "StaticArrays"])
+                @test Set(only(deps["RootPkg"])["deps"]) ==
+                    Set(["JSON", "LocalA", "LocalB"])
+                run(`$(Base.julia_cmd()) --project=. -e 'using Pkg; Pkg.test(; allow_reresolve = false)'`)
+
+                restored = TOML.parsefile("Project.toml")
+                @test Set(keys(restored["sources"])) == Set(["LocalA", "LocalB"])
+                @test haskey(restored["weakdeps"], "DataStructures")
+                @test !haskey(restored["deps"], "DataStructures")
+                @test !haskey(restored["deps"], "Preferences")
+                @test !haskey(restored["deps"], "StaticArrays")
+            end
+        end
+    end
+
+    @testset "nested path sources remain local and constrain minimum resolution" begin
+        mktempdir() do dir
+            cd(dir) do
+                mkpath("LocalB/src")
+                write(
+                    "LocalB/Project.toml",
+                    """
+                    name = "LocalB"
+                    uuid = "44444444-4444-4444-4444-444444444444"
+                    version = "0.1.0"
+
+                    [deps]
+                    DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
+
+                    [compat]
+                    DataStructures = "0.18"
+                    julia = "1.10"
+                    """
+                )
+                write(
+                    "LocalB/src/LocalB.jl",
+                    "module LocalB\nusing DataStructures\nconst selected_version = Base.pkgversion(DataStructures)\nend\n"
+                )
+
+                mkpath("LocalA/src")
+                write(
+                    "LocalA/Project.toml",
+                    """
+                    name = "LocalA"
+                    uuid = "55555555-5555-5555-5555-555555555555"
+                    version = "0.1.0"
+
+                    [deps]
+                    DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
+                    LocalB = "44444444-4444-4444-4444-444444444444"
+
+                    [sources.LocalB]
+                    path = "../LocalB"
+
+                    [compat]
+                    DataStructures = "0.18.1"
+                    LocalB = "0.1"
+                    julia = "1.10"
+                    """
+                )
+                write(
+                    "LocalA/src/LocalA.jl",
+                    "module LocalA\nusing DataStructures, LocalB\nconst selected_version = LocalB.selected_version\nend\n"
+                )
+
+                mkpath("src")
+                mkpath("test")
+                write(
+                    "src/RootPkg.jl",
+                    "module RootPkg\nusing LocalA\nconst selected_version = LocalA.selected_version\nend\n"
+                )
+                write(
+                    "test/runtests.jl",
+                    "using RootPkg, Test\n@test RootPkg.selected_version == v\"0.18.1\"\n"
+                )
+                write(
+                    "Project.toml",
+                    """
+                    name = "RootPkg"
+                    uuid = "66666666-6666-6666-6666-666666666666"
+                    version = "0.1.0"
+
+                    [deps]
+                    LocalA = "55555555-5555-5555-5555-555555555555"
+
+                    [sources.LocalA]
+                    path = "LocalA"
+
+                    [compat]
+                    LocalA = "0.1"
+                    Test = "1.10"
+                    julia = "1.10"
+
+                    [extras]
+                    Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+                    [targets]
+                    test = ["Test"]
+                    """
+                )
+
+                run(`$(Base.julia_cmd()) $downgrade_jl "" "." "deps" "1"`)
+
+                manifest = TOML.parsefile("Manifest.toml")
+                deps = manifest["deps"]
+                @test only(deps["DataStructures"])["version"] == "0.18.1"
+                @test only(deps["LocalA"])["path"] == "LocalA"
+                @test Set(only(deps["LocalA"])["deps"]) == Set(["DataStructures", "LocalB"])
+                @test only(deps["LocalB"])["path"] == "LocalB"
+                @test only(deps["LocalB"])["deps"] == ["DataStructures"]
+                run(`$(Base.julia_cmd()) --project=. -e 'using Pkg; Pkg.test(; allow_reresolve = false)'`)
+
+                restored = TOML.parsefile("Project.toml")
+                @test Set(keys(restored["sources"])) == Set(["LocalA"])
+                @test !haskey(restored["deps"], "LocalB")
+                @test !haskey(restored["deps"], "DataStructures")
+            end
+        end
+    end
+
+    @testset "split projects rebase direct path sources in both locked manifests" begin
+        mktempdir() do dir
+            cd(dir) do
+                mkpath("LocalDep/src")
+                write(
+                    "LocalDep/Project.toml",
+                    """
+                    name = "LocalDep"
+                    uuid = "99999999-9999-9999-9999-999999999999"
+                    version = "0.1.0"
+
+                    [deps]
+                    StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+
+                    [compat]
+                    StaticArrays = "1.9.8"
+                    """
+                )
+                write("LocalDep/src/LocalDep.jl", "module LocalDep\nusing StaticArrays\nend\n")
+
+                mkpath("LocalTest/src")
+                write(
+                    "LocalTest/Project.toml",
+                    """
+                    name = "LocalTest"
+                    uuid = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+                    version = "0.1.0"
+                    """
+                )
+                write("LocalTest/src/LocalTest.jl", "module LocalTest\nend\n")
+
+                mkpath("src")
+                mkpath("test")
+                write("src/RootPkg.jl", "module RootPkg\nusing LocalDep\nend\n")
+                write(
+                    "test/runtests.jl",
+                    "using Test, BenchmarkTools, RootPkg\n@test true\n"
+                )
+                write(
+                    "Project.toml",
+                    """
+                    name = "RootPkg"
+                    uuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+                    version = "0.1.0"
+
+                    [deps]
+                    JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+                    LocalDep = "99999999-9999-9999-9999-999999999999"
+
+                    [sources]
+                    LocalDep = {path = "LocalDep"}
+                    LocalTest = {path = "LocalTest"}
+
+                    [compat]
+                    julia = "1.10"
+                    JSON = "0.21.4"
+                    LocalDep = "0.1"
+
+                    [extras]
+                    LocalTest = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+                    [targets]
+                    test = ["LocalTest"]
+                    """
+                )
+                original_project = read("Project.toml", String)
+                write(
+                    "test/Project.toml",
+                    """
+                    [deps]
+                    BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
+                    RootPkg = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+                    [sources]
+                    RootPkg = {path = ".."}
+
+                    [compat]
+                    BenchmarkTools = "1.5.0"
+                    """
+                )
+
+                run(`$(Base.julia_cmd()) $downgrade_jl "" ".,test" "alldeps" "1"`)
+
+                main_manifest = TOML.parsefile("Manifest.toml")
+                test_manifest = TOML.parsefile("test/Manifest.toml")
+                main_deps = main_manifest["deps"]
+                test_deps = test_manifest["deps"]
+                @test only(main_deps["StaticArrays"])["version"] == "1.9.8"
+                @test only(main_deps["JSON"])["version"] == "0.21.4"
+                @test only(main_deps["BenchmarkTools"])["version"] == "1.5.0"
+                @test only(main_deps["LocalDep"])["path"] == "LocalDep"
+                @test only(main_deps["LocalTest"])["path"] == "LocalTest"
+                @test only(test_deps["LocalDep"])["path"] == "../LocalDep"
+                @test only(test_deps["LocalTest"])["path"] == "../LocalTest"
+                @test only(main_deps["RootPkg"])["path"] == "."
+                @test only(test_deps["RootPkg"])["path"] == ".."
+                expected_root_deps = VERSION >= v"1.11" ?
+                                     Set(["JSON", "LocalDep"]) :
+                                     Set(["JSON", "LocalDep", "LocalTest"])
+                @test Set(only(test_deps["RootPkg"])["deps"]) == expected_root_deps
+                if VERSION >= v"1.11"
+                    @test read("Project.toml", String) == original_project
+                end
+
+                locked = Dict(
+                    name => only(test_deps[name])["version"]
+                    for name in ("BenchmarkTools", "JSON", "StaticArrays")
+                )
+                run(`$(Base.julia_cmd()) --project=test -e 'using Pkg; Pkg.instantiate(); include("test/runtests.jl")'`)
+                after = TOML.parsefile("test/Manifest.toml")["deps"]
+                @test locked == Dict(
+                    name => only(after[name])["version"] for name in keys(locked)
+                )
+            end
+        end
+    end
+
+    @testset "root and path-source compat constraints must overlap" begin
+        mktempdir() do dir
+            cd(dir) do
+                mkpath("LocalDep/src")
+                write(
+                    "LocalDep/Project.toml",
+                    """
+                    name = "LocalDep"
+                    uuid = "77777777-7777-7777-7777-777777777777"
+                    version = "0.1.0"
+
+                    [deps]
+                    JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+
+                    [compat]
+                    JSON = "0.20"
+                    """
+                )
+                write("LocalDep/src/LocalDep.jl", "module LocalDep\nusing JSON\nend\n")
+
+                mkpath("src")
+                mkpath("test")
+                write("src/RootPkg.jl", "module RootPkg\nusing LocalDep\nend\n")
+                write("test/runtests.jl", "using Test, RootPkg\n@test true\n")
+                write(
+                    "Project.toml",
+                    """
+                    name = "RootPkg"
+                    uuid = "88888888-8888-8888-8888-888888888888"
+                    version = "0.1.0"
+
+                    [deps]
+                    JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+                    LocalDep = "77777777-7777-7777-7777-777777777777"
+
+                    [sources]
+                    LocalDep = {path = "LocalDep"}
+
+                    [compat]
+                    julia = "1.10"
+                    JSON = "=0.21.4"
+                    LocalDep = "0.1"
+
+                    [extras]
+                    Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+                    [targets]
+                    test = ["Test"]
+                    """
+                )
+
+                output = IOBuffer()
+                process = run(
+                    pipeline(
+                        `$(Base.julia_cmd()) $downgrade_jl "" "." "deps" "1.10"`;
+                        stdout = output, stderr = output
+                    ); wait = false
+                )
+                wait(process)
+                log = String(take!(output))
+                @test !success(process)
+                @test occursin(
+                    "Root project and path source LocalDep require JSON with disjoint compat entries",
+                    log
+                )
+            end
+        end
+    end
+
+    @testset "direct path sources reject disjoint compat for a promoted dependency" begin
+        mktempdir() do dir
+            cd(dir) do
+                for (name, uuid, constraint) in (
+                        ("LocalA", "44444444-4444-4444-4444-444444444444", "0.12"),
+                        ("LocalB", "66666666-6666-6666-6666-666666666666", "1.9.9"),
+                    )
+                    mkpath("$name/src")
+                    write(
+                        "$name/Project.toml",
+                        """
+                        name = "$name"
+                        uuid = "$uuid"
+                        version = "0.1.0"
+
+                        [deps]
+                        StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+
+                        [compat]
+                        StaticArrays = "$constraint"
+                        """
+                    )
+                    write("$name/src/$name.jl", "module $name\nend\n")
+                end
+                mkdir("test")
+                write(
+                    "Project.toml",
+                    """
+                    name = "RootPkg"
+                    uuid = "55555555-5555-5555-5555-555555555555"
+                    version = "0.1.0"
+
+                    [deps]
+                    LocalA = "44444444-4444-4444-4444-444444444444"
+
+                    [sources]
+                    LocalA = {path = "LocalA"}
+
+                    [compat]
+                    julia = "1.10"
+                    LocalA = "0.1"
+                    """
+                )
+                write(
+                    "test/Project.toml",
+                    """
+                    [deps]
+                    LocalB = "66666666-6666-6666-6666-666666666666"
+                    RootPkg = "55555555-5555-5555-5555-555555555555"
+
+                    [sources]
+                    LocalB = {path = "../LocalB"}
+                    RootPkg = {path = ".."}
+
+                    [compat]
+                    LocalB = "0.1"
+                    """
+                )
+
+                output = IOBuffer()
+                process = run(
+                    pipeline(
+                        `$(Base.julia_cmd()) $downgrade_jl "" ".,test" "deps" "1.10"`;
+                        stdout = output, stderr = output
+                    ); wait = false
+                )
+                wait(process)
+                @test !success(process)
+                @test occursin("disjoint compat entries", String(take!(output)))
+            end
+        end
+    end
+
+    @testset "direct path sources intersect overlapping compat for a promoted dependency" begin
+        mktempdir() do dir
+            cd(dir) do
+                # Two path sources constrain a shared registry dependency with
+                # overlapping, lower-bounded-only ranges. Their intersection is
+                # open-upper, so the serializer must emit ">= 0.18.0"; the earlier
+                # string(spec)+regex approach instead emitted the unparseable
+                # "0.18.0 - *" on Julia 1.11+ and aborted the resolution.
+                for (name, uuid, constraint) in (
+                        ("LocalA", "44444444-4444-4444-4444-444444444444", ">= 0.17"),
+                        ("LocalB", "66666666-6666-6666-6666-666666666666", ">= 0.18"),
+                    )
+                    mkpath("$name/src")
+                    write(
+                        "$name/Project.toml",
+                        """
+                        name = "$name"
+                        uuid = "$uuid"
+                        version = "0.1.0"
+
+                        [deps]
+                        DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
+
+                        [compat]
+                        DataStructures = "$constraint"
+                        """
+                    )
+                    write("$name/src/$name.jl", "module $name\nend\n")
+                end
+                mkdir("test")
+                write(
+                    "Project.toml",
+                    """
+                    name = "RootPkg"
+                    uuid = "55555555-5555-5555-5555-555555555555"
+                    version = "0.1.0"
+
+                    [deps]
+                    LocalA = "44444444-4444-4444-4444-444444444444"
+
+                    [sources]
+                    LocalA = {path = "LocalA"}
+
+                    [compat]
+                    julia = "1.10"
+                    LocalA = "0.1"
+                    """
+                )
+                write(
+                    "test/Project.toml",
+                    """
+                    [deps]
+                    LocalB = "66666666-6666-6666-6666-666666666666"
+                    RootPkg = "55555555-5555-5555-5555-555555555555"
+
+                    [sources]
+                    LocalB = {path = "../LocalB"}
+                    RootPkg = {path = ".."}
+
+                    [compat]
+                    LocalB = "0.1"
+                    """
+                )
+
+                # Resolve for the running Julia rather than a fixed target. The
+                # serializer runs during the merge, before the resolver, so the
+                # target is irrelevant to what this checks; matching it to the
+                # runtime keeps resolution single-runtime. DataStructures 0.18.0
+                # resolved for an older target from a newer runtime otherwise pulls
+                # a stdlib JLL absent from the newer depot -- the action's
+                # documented cross-runtime fragility, unrelated to compat serializing.
+                target = string(VERSION.major, '.', VERSION.minor)
+                run(`$(Base.julia_cmd()) $downgrade_jl "" ".,test" "deps" $target`)
+
+                @test isfile("Manifest.toml")
+                manifest = TOML.parsefile("Manifest.toml")
+                # 0.18.0 is the intersection floor; LocalA's ">= 0.17" alone would
+                # resolve to 0.17.x, so this also confirms the intersection applied.
+                @test only(manifest["deps"]["DataStructures"])["version"] == "0.18.0"
             end
         end
     end
